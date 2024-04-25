@@ -111,6 +111,11 @@ pub struct SubmitBlockParams {
 }
 
 #[derive(Serialize, Deserialize)]
+pub struct SubmitMinerHashrateParams {
+    pub hashrate: f64, // miner current hashrate
+}
+
+#[derive(Serialize, Deserialize)]
 pub struct GetBalanceParams<'a> {
     pub address: Cow<'a, Address>,
     pub asset: Cow<'a, Hash>

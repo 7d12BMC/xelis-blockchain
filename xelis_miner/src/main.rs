@@ -78,6 +78,8 @@ use anyhow::{
     Context
 };
 use lazy_static::lazy_static;
+use tokio::time::interval;
+use xelis_common::api::daemon::SubmitMinerHashrateParams;
 
 #[derive(Parser)]
 #[clap(version = VERSION, about = "XELIS: An innovate cryptocurrency with BlockDAG and Homomorphic Encryption enabling Smart Contracts")]
@@ -145,6 +147,8 @@ static HASHRATE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 lazy_static! {
     static ref HASHRATE_LAST_TIME: Mutex<Instant> = Mutex::new(Instant::now());
+    static ref HASHRATE_LAST_TIME_CALCULATED: Mutex<f64> = Mutex::new(0.0);
+
 }
 
 // After how many iterations we update the timestamp of the block to avoid too much CPU usage 
@@ -155,13 +159,10 @@ async fn main() -> Result<()> {
     let config: MinerConfig = MinerConfig::parse();
     let prompt = Prompt::new(config.log_level, &config.logs_path, &config.filename_log, config.disable_file_logging)?;
 
-    let threads_count = match thread::available_parallelism() {
-        Ok(value) => value,
-        Err(e) => {
-            warn!("Couldn't detect number of available threads: {}, fallback to 1 thread only", e);
-            NonZeroUsize::new(1).unwrap()
-        }
-    }.get();
+    let threads_count = thread::available_parallelism().unwrap_or_else(|e| {
+        warn!("Couldn't detect number of available threads: {}, fallback to 1 thread only", e);
+        NonZeroUsize::new(1).unwrap()
+    }).get();
     let mut threads = config.num_threads;
 
     // if no specific threads count is specified in options, set detected threads count
@@ -286,11 +287,18 @@ async fn communication_task(daemon_address: String, job_sender: broadcast::Sende
         };
         WEBSOCKET_CONNECTED.store(true, Ordering::SeqCst);
         info!("Connected successfully to {}", daemon_address);
+        // 连接到节点服务器，打开Websocket通道
         let (mut write, mut read) = client.split();
+
+        // 创建一个间隔计时器，每隔 10 分钟触发一次
+        let mut update_hashrate_interval = interval(Duration::from_secs(10));
+        // 循环获取节点发来的消息
         loop {
             select! {
+                // 如果有来自节点的消息，处理它
                 Some(message) = read.next() => { // read all messages from daemon
-                    debug!("Received message from daemon: {:?}", message);
+                    // debug!("Received message from daemon: {:?}", message);
+                    debug!("从节点服务器接收到消息: {:?}", message);
                     match handle_websocket_message(message, &job_sender).await {
                         Ok(exit) => {
                             if exit {
@@ -304,14 +312,33 @@ async fn communication_task(daemon_address: String, job_sender: broadcast::Sende
                         }
                     }
                 },
+                // 如果有找到的块，发送给节点
                 Some(block) = block_receiver.recv() => { // send all valid blocks found to the daemon
-                    info!("submitting new block found...");
+                    // info!("submitting new block found...");
+                    info!("正在提交已找到的块...");
                     let submit = serde_json::json!(SubmitBlockParams { block_template: block.to_hex() }).to_string();
                     if let Err(e) = write.send(Message::Text(submit)).await {
                         error!("Error while sending the block found to the daemon: {}", e);
                         break;
                     }
-                    debug!("Block found has been sent to daemon");
+                    // debug!("Block found has been sent to daemon");
+                    debug!("已将找到的块提交给节点服务器");
+                }
+
+                _ = update_hashrate_interval.tick() => {
+                    // info!("submitting new block found...");
+                    // info!("正在提交已找到的块...");
+                    let hashrate ={ *HASHRATE_LAST_TIME_CALCULATED.lock().await };
+                    let submit = serde_json::json!(SubmitMinerHashrateParams { hashrate }).to_string();
+                    if let Err(e) = write.send(Message::Text(submit)).await {
+                        error!("Error while sending the hashrate update to the daemon: {}", e);
+                        break;
+                    }
+                    // debug!("Block found has been sent to daemon");
+                    // debug!("已将找到的块提交给节点服务器");
+                    // let elapsed = last_log_time.elapsed();
+                    // info!("Logging... Elapsed time since last log: {}s", elapsed.as_secs());
+                    // last_log_time = Instant::now();
                 }
             }
         }
@@ -479,6 +506,11 @@ async fn run_prompt(prompt: ShareablePrompt) -> Result<()> {
             let counter = HASHRATE_COUNTER.swap(0, Ordering::SeqCst);
 
             let hashrate = 1000f64 / (last_time.elapsed().as_millis() as f64 / counter as f64);
+            if counter != 0 {
+
+                // 记录到本地的缓存中
+                *HASHRATE_LAST_TIME_CALCULATED.lock().await = hashrate;
+            }
             *last_time = Instant::now();
 
             prompt::colorize_string(Color::Green, &format!("{}", format_hashrate(hashrate)))

@@ -59,6 +59,8 @@ use xelis_common::{
         InternalRpcError
     }
 };
+use xelis_common::api::daemon::SubmitMinerHashrateParams;
+use xelis_common::utils::format_hashrate;
 use crate::{
     core::{
         blockchain::Blockchain,
@@ -96,7 +98,9 @@ pub struct Miner {
     // blocks accepted by us since he is connected
     blocks_accepted: usize,
     // blocks rejected since he is connected
-    blocks_rejected: usize
+    blocks_rejected: usize,
+    // the hash rate of the miner
+    hashrate: f64
 }
 
 impl Miner {
@@ -107,7 +111,8 @@ impl Miner {
             key,
             name,
             blocks_accepted: 0,
-            blocks_rejected: 0
+            blocks_rejected: 0,
+            hashrate: 0.0
         }
     }
 
@@ -123,6 +128,10 @@ impl Miner {
         &self.name
     }
 
+    pub fn get_hashrate(&self) -> f64 {
+        self.hashrate
+    }
+
     pub fn get_blocks_accepted(&self) -> usize {
         self.blocks_accepted
     }
@@ -130,7 +139,7 @@ impl Miner {
 
 impl Display for Miner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Miner[address={}, name={}, accepted={}, rejected={}]", self.key.as_address(self.mainnet), self.name, self.blocks_accepted, self.blocks_rejected)
+        write!(f, "Miner[address={}, name={}, accepted={}, rejected={}, hashrate={}]", self.key.as_address(self.mainnet), self.name, self.blocks_accepted, self.blocks_rejected, format_hashrate(self.hashrate))
     }
 }
 
@@ -156,16 +165,17 @@ impl<S: Storage> StreamHandler<Result<Message, ProtocolError>> for GetWorkWebSoc
             Ok(Message::Text(text)) => {
                 debug!("New message incoming from miner: {}", text);
                 let address = ctx.address();
-                let template: SubmitBlockParams = match serde_json::from_slice(text.as_bytes()) {
-                    Ok(template) => template,
-                    Err(e) => {
-                        debug!("Error while decoding message from {:?}: {}", address, e);
-                        return;
-                    }
-                };
 
-                let server = self.server.clone();
-                ctx.wait(actix::fut::wrap_future(server.handle_block_for(address, template)));
+                if let Ok(template) = serde_json::from_slice(text.as_bytes())  {
+                    let server = self.server.clone();
+                    ctx.wait(actix::fut::wrap_future(server.handle_block_for(address, template)));
+                } else if let Ok(params) = serde_json::from_slice(text.as_bytes()) {
+
+                    let server = self.server.clone();
+                    ctx.wait(actix::fut::wrap_future(server.handle_hashrate_submit(address, params)));
+                } else{
+                    debug!("Error while decoding message from {:?}: {}", address, text);
+                }
             },
             Ok(Message::Close(reason)) => {
                 ctx.close(reason);
@@ -280,7 +290,7 @@ impl<S: Storage> GetWorkServer<S> {
         addr.send(Response::NewJob(GetBlockTemplateResult { template: job.to_hex(), height, difficulty })).await.context("error while sending block template")??;
         Ok(())
     }
-
+    // 添加Miner getwork_endpoint
     pub async fn add_miner(self: &Arc<Self>, addr: Addr<GetWorkWebSocketHandler<S>>, key: PublicKey, worker: String) {
         trace!("add miner");
         {
@@ -293,6 +303,7 @@ impl<S: Storage> GetWorkServer<S> {
         // notify the new miner so he can work ASAP
         let zelf = Arc::clone(&self);
         tokio::spawn(async move {
+            // 给miner发任务
             if let Err(e) = zelf.send_new_job(addr, key).await {
                 error!("Error while sending new job to miner: {}", e);
             }
@@ -345,19 +356,30 @@ impl<S: Storage> GetWorkServer<S> {
         })
     }
 
+    pub async fn handle_hashrate_submit(self: Arc<Self>, addr: Addr<GetWorkWebSocketHandler<S>>, params: SubmitMinerHashrateParams) {
+        trace!("handle hashrate submit");
+
+        // update miner stats
+        {
+            let mut miners = self.miners.lock().await;
+            if let Some(miner) = miners.get_mut(&addr) {
+                debug!("Miner {} update hashrate!", miner);
+                miner.hashrate = params.hashrate;
+            }
+        }
+    }
+
+
     // handle the incoming mining job from the miner
     // decode the block miner, and using its header work hash, retrieve the block header
     // if its block is rejected, resend him the job
     pub async fn handle_block_for(self: Arc<Self>, addr: Addr<GetWorkWebSocketHandler<S>>, template: SubmitBlockParams) {
         trace!("handle block for");
         let response = match BlockMiner::from_hex(template.block_template) {
-            Ok(job) => match self.accept_miner_job(job).await {
-                Ok(response) => response,
-                Err(e) => {
-                    debug!("Error while accepting miner job: {}", e);
-                    Response::BlockRejected(e.to_string())
-                }
-            },
+            Ok(job) => self.accept_miner_job(job).await.unwrap_or_else(|e| {
+                debug!("Error while accepting miner job: {}", e);
+                Response::BlockRejected(e.to_string())
+            }),
             Err(e) => {
                 debug!("Error while decoding block miner: {}", e);
                 Response::BlockRejected(e.to_string())

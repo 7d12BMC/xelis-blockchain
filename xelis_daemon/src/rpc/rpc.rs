@@ -99,6 +99,9 @@ use human_bytes::human_bytes;
 use serde_json::{json, Value};
 use std::{sync::Arc, borrow::Cow};
 use log::{info, debug, trace};
+use serde::Serialize;
+use xelis_common::api::daemon::NotifyEvent;
+use xelis_common::utils::format_hashrate;
 
 // Get the block type using the block hash and the blockchain current state
 pub async fn get_block_type_for_block<S: Storage>(blockchain: &Blockchain<S>, storage: &S, hash: &Hash) -> Result<BlockType, InternalRpcError> {
@@ -285,6 +288,9 @@ pub async fn get_peer_entry(peer: &Peer) -> PeerEntry {
 // This function is used to register all the RPC methods
 pub fn register_methods<S: Storage>(handler: &mut RPCHandler<Arc<Blockchain<S>>>) {
     info!("Registering RPC methods...");
+    // handler.register_method("submit_hashrate", async_handler!(submit_hashrate::<S>));
+
+    handler.register_method("get_miners", async_handler!(get_miners::<S>));
     handler.register_method("get_version", async_handler!(version::<S>));
     handler.register_method("get_height", async_handler!(get_height::<S>));
     handler.register_method("get_topoheight", async_handler!(get_topoheight::<S>));
@@ -442,7 +448,34 @@ async fn has_balance<S: Storage>(context: Context, body: Value) -> Result<Value,
 
     Ok(json!(HasBalanceResult { exist }))
 }
+async fn get_miners<S: Storage>(context: Context, _body: Value) -> Result<Value, InternalRpcError> {
+    let blockchain: &Arc<Blockchain<S>> = context.get()?;
+    #[derive(Serialize)]
+    struct MinerInfo {
+        // name: String,
+        hashrate: String,
+        blocks_accepted: usize
 
+    }
+    let mut miners_info = std::collections::HashMap::new();
+    match blockchain.get_rpc().read().await.as_ref() {
+        Some(rpc) => match rpc.getwork_server() {
+            Some(getwork) => {
+                let miners = getwork.get_miners().lock().await;
+                for miner in miners.values() {
+                    miners_info.insert(miner.get_name().to_string(), MinerInfo {
+                        // name: miner.get_name().to_string(),
+                        hashrate: format_hashrate(miner.get_hashrate()),
+                        blocks_accepted: miner.get_blocks_accepted(),
+                    });
+                }
+            },
+            None => {}
+        },
+        None => {}
+    };
+    Ok(serde_json::to_value(miners_info).unwrap())
+}
 async fn get_info<S: Storage>(context: Context, body: Value) -> Result<Value, InternalRpcError> {
     if body != Value::Null {
         return Err(InternalRpcError::UnexpectedParams)
